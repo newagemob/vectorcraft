@@ -64,13 +64,33 @@ fn save_extensions() -> Vec<&'static str> {
 }
 
 fn tool(name: &str, title: &str, desc: &str, schema: Value, read_only: bool) -> Value {
-    json!({
+    let mut t = json!({
         "name": name,
         "title": title,
         "description": desc,
         "inputSchema": schema,
         "annotations": {"title": title, "readOnlyHint": read_only, "openWorldHint": false},
-    })
+    });
+    if let Some(d) = destructive_hint(name, read_only) {
+        t["annotations"]["destructiveHint"] = json!(d);
+    }
+    t
+}
+
+/// MCP `destructiveHint` where it is known: read-only tools never are; tools that can change or
+/// remove what exists (any command, paint, transforms, files on disk, undo/redo) are; tools that only
+/// add are not. Raw input (`pointer_gesture`, `press_key`, `type_text`) depends on what it drives:
+/// omitted.
+fn destructive_hint(name: &str, read_only: bool) -> Option<bool> {
+    if read_only {
+        return Some(false);
+    }
+    match name {
+        "run_command" | "invoke_menu" | "set_paint" | "save_file" | "export" | "apply_effect" | "pathfinder" | "transform" | "text_wrap" | "undo"
+        | "redo" => Some(true),
+        "select_tool" | "open_panel" | "open_file" | "draw_path" | "draw_shape" | "add_text" | "create_graph" => Some(false),
+        _ => None,
+    }
 }
 
 /// All tools, in `tools/list` order.

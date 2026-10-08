@@ -588,3 +588,24 @@ fn type_preferences_apply_to_agents() {
     assert_eq!(r["isError"], false, "{r}");
     assert_eq!(style(&mut s, 6), (size + 4.0, tracking + 50.0));
 }
+
+// ---------- command metadata ----------
+
+#[test]
+fn listing_and_tools_carry_effect_metadata() {
+    let mut s = server();
+    let r = call(&mut s, 1, "list_commands", json!({}));
+    let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+    let cmds = v["commands"].as_array().unwrap();
+    let get = |id: &str| cmds.iter().find(|c| c["id"] == id).unwrap().clone();
+    assert_eq!(get("object.group")["journal"], true);
+    // Host commands (app.export…) are not registry commands and carry no flag.
+    assert!(cmds.iter().filter(|c| c["host"] != true).all(|c| c["journal"].is_boolean()), "every engine command says whether it is journaled");
+    assert!(cmds.iter().any(|c| c["journal"] == false), "queries are not journaled");
+    let tools = tool_definitions();
+    let ann = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap()["annotations"].clone();
+    assert_eq!(ann("list_commands")["destructiveHint"], false);
+    assert_eq!(ann("run_command")["destructiveHint"], true);
+    assert_eq!(ann("draw_shape")["destructiveHint"], false);
+    assert!(ann("press_key").get("destructiveHint").is_none());
+}
