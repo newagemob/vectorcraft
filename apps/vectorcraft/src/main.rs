@@ -1,11 +1,14 @@
 //! VectorCraft desktop app.
 //!
-//! Usage: `vectorcraft [--control <port>] [--in-window-menus] [files…]`
+//! Usage: `vectorcraft [--control <port>] [--control-token HEX | --control-token-file PATH]
+//! [--control-port-file PATH] [--control-no-auth] [--in-window-menus] [files…]`
 //!
 //! `--in-window-menus` (or `VECTORCRAFT_IN_WINDOW_MENUS=1`) keeps the menus inside the window on
 //! macOS instead of the macOS menu bar (`mac_menu`).
 //!
-//! `--control <port>` (or `VECTORCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server:
+//! `--control <port>` (or `VECTORCRAFT_CONTROL_PORT`; 0 = any free port) starts a localhost JSON-lines
+//! control server; each connection first authenticates with the per-launch token (`control_auth`,
+//! docs/control-protocol.md):
 //! `{"id":1,"method":"ui.inspect","params":{}}` → `{"id":1,"ok":true,"result":…}`.
 //! See `vectorcraft_ui_egui::control` for the methods.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
@@ -18,6 +21,7 @@ compile_error!("windows7 requires --target x86_64-win7-windows-msvc; the ordinar
 compile_error!("the win7 target requires --no-default-features --features windows7");
 
 mod clipboard;
+mod control_auth;
 mod control_server;
 #[cfg(feature = "wgpu")]
 mod gpu;
@@ -313,7 +317,8 @@ fn main() -> std::process::ExitCode {
     let mut control_port: Option<u16> = std::env::var("VECTORCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok());
     let mut files = Vec::new();
     let mut in_window_menus = std::env::var_os("VECTORCRAFT_IN_WINDOW_MENUS").is_some_and(|v| !v.is_empty() && v != "0");
-    let mut args = std::env::args().skip(1);
+    let (control_rest, control_args) = control_auth::split_or_exit(std::env::args().skip(1));
+    let mut args = control_rest.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--control" => control_port = args.next().and_then(|p| p.parse().ok()),
@@ -382,6 +387,7 @@ fn main() -> std::process::ExitCode {
     open_documents::install();
     #[cfg(feature = "wgpu")]
     let created = startup.clone();
+    let control = control_auth::resolve_or_exit(control_port, &control_args);
     // A panic that ends the window (egui-wgpu's own, #502) is caught here: never a crash.
     let outcome = vectorcraft_engine::guard::catch_panic(|| {
         eframe::run_native(
@@ -424,8 +430,8 @@ fn main() -> std::process::ExitCode {
                 }
                 app.integrated_titlebar = cfg!(target_os = "macos");
                 app.custom_titlebar = CUSTOM_TITLEBAR;
-                if let Some(port) = control_port {
-                    let rx = control_server::start(port, cc.egui_ctx.clone());
+                if let Some((port, auth)) = control.clone() {
+                    let rx = control_server::start(port, auth, cc.egui_ctx.clone());
                     app = app.with_control(rx);
                 }
                 #[cfg(target_os = "macos")]

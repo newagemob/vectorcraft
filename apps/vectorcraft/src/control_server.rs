@@ -15,6 +15,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+
+use crate::control_auth::{ControlAuth, authenticate, write_port_file};
 use vectorcraft_ui_egui::ControlRequest;
 
 /// Longest accepted request line (bytes, without the newline). Requests are small JSON objects;
@@ -23,7 +25,7 @@ pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Connections served at once; further ones get an error line and are closed.
 pub const MAX_CONNECTIONS: usize = 16;
 
-pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
+pub fn start(port: u16, auth: ControlAuth, ctx: egui::Context) -> Receiver<ControlRequest> {
     let (tx, rx) = channel::<ControlRequest>();
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
@@ -32,12 +34,28 @@ pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
             return rx;
         }
     };
-    eprintln!("vectorcraft: control server listening on 127.0.0.1:{port}");
-    std::thread::spawn(move || accept_loop(listener, tx, ctx));
+    // `--control 0` binds a free port: report (and write) the real one.
+    let port = listener.local_addr().map_or(port, |a| a.port());
+    let how = if auth.token.is_some() { "token required" } else { "no authentication: --control-no-auth" };
+    eprintln!("vectorcraft: control server listening on 127.0.0.1:{port} ({how})");
+    if let Some(path) = &auth.port_file {
+        match write_port_file(path, port, auth.token.as_deref()) {
+            Ok(()) => eprintln!("vectorcraft: control port file {}", path.display()),
+            Err(e) => eprintln!("vectorcraft: cannot write the control port file: {e}"),
+        }
+    }
+    let token: Option<Arc<str>> = auth.token.map(Arc::from);
+    std::thread::spawn(move || accept_loop_with(listener, tx, ctx, token));
     rx
 }
 
+#[cfg(test)]
 fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context) {
+    accept_loop_with(listener, tx, ctx, None);
+}
+
+/// Accept connections; with a `token`, each must authenticate first (see `control_auth`).
+fn accept_loop_with(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context, token: Option<Arc<str>>) {
     let open = Arc::new(AtomicUsize::new(0));
     for mut stream in listener.incoming().flatten() {
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -48,17 +66,18 @@ fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Con
         }
         let tx = tx.clone();
         let ctx = ctx.clone();
+        let token = token.clone();
         let open = Arc::clone(&open);
         std::thread::spawn(move || {
-            serve(stream, &tx, &ctx);
+            serve(stream, &tx, &ctx, token.as_deref());
             open.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
 
-fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
+fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, token: Option<&str>) {
     let Ok(read) = stream.try_clone() else { return };
-    serve_lines(read, stream, |method, params| {
+    serve_lines_with(read, stream, token, |method, params| {
         let (req, rrx) = ControlRequest::new(method, params);
         tx.send(req).ok()?;
         ctx.request_repaint();
@@ -130,9 +149,17 @@ fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -
 /// Serve requests from `read`, answering on `out`, until the peer closes, sends something that is
 /// not a request, or `handle` returns `None` (app gone). `handle` gets `(method, params)` and
 /// returns the reply object (the request's `id` is added here).
-fn serve_lines<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(String, Value) -> Option<Value>) {
+#[cfg(test)]
+fn serve_lines<R: Read, W: Write>(read: R, out: W, handle: impl FnMut(String, Value) -> Option<Value>) {
+    serve_lines_with(read, out, None, handle);
+}
+
+/// [`serve_lines`] behind a token: the first request must be `auth {token}`; any other first
+/// request is refused and the connection closed before anything runs.
+fn serve_lines_with<R: Read, W: Write>(read: R, mut out: W, token: Option<&str>, mut handle: impl FnMut(String, Value) -> Option<Value>) {
     let mut reader = BufReader::new(read);
     let mut buf = Vec::new();
+    let mut authenticated = token.is_none();
     loop {
         let reject = match read_bounded_line(&mut reader, &mut buf, MAX_LINE) {
             Ok(false) => return,
@@ -141,6 +168,14 @@ fn serve_lines<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(St
                 Line::Blank => continue,
                 Line::Reject(e) => e,
                 Line::Request { id, method, params } => {
+                    if !authenticated {
+                        let (reply, ok) = authenticate(id, &method, &params, token.unwrap_or_default());
+                        if writeln!(out, "{reply}").and_then(|()| out.flush()).is_err() || !ok {
+                            return;
+                        }
+                        authenticated = true;
+                        continue;
+                    }
                     let Some(mut r) = handle(method, params) else { return };
                     if let Some(o) = r.as_object_mut() {
                         o.insert("id".into(), id);
@@ -277,5 +312,60 @@ mod tests {
         BufReader::new(&mut extra).read_line(&mut line).unwrap();
         assert!(line.contains("too many control connections"), "{line}");
         drop(held);
+    }
+
+    // ---------- token authentication ----------
+
+    fn run_with(token: &str, input: &[u8]) -> (Vec<Value>, Vec<String>) {
+        let mut out = Vec::new();
+        let mut calls = Vec::new();
+        serve_lines_with(input, &mut out, Some(token), |m, _p| {
+            calls.push(m);
+            Some(json!({"ok": true, "result": null}))
+        });
+        let replies = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).collect();
+        (replies, calls)
+    }
+
+    #[test]
+    fn requests_without_the_token_are_refused() {
+        let t = crate::control_auth::generate_token().unwrap();
+        let (r, calls) = run_with(&t, b"{\"id\":1,\"method\":\"engine.execute\",\"params\":{\"command\":\"file.new\"}}\n{\"id\":2,\"method\":\"auth\",\"params\":{\"token\":\"x\"}}\n");
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(r, vec![json!({"id": 1, "ok": false, "error": "authentication required"})]);
+        let wrong = crate::control_auth::generate_token().unwrap();
+        let (r, calls) =
+            run_with(&t, format!("{{\"id\":1,\"method\":\"auth\",\"params\":{{\"token\":\"{wrong}\"}}}}\n{{\"method\":\"a\"}}\n").as_bytes());
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["error"], "authentication required");
+    }
+
+    #[test]
+    fn requests_after_auth_run() {
+        let t = crate::control_auth::generate_token().unwrap();
+        let (r, calls) =
+            run_with(&t, format!("{{\"id\":1,\"method\":\"auth\",\"params\":{{\"token\":\"{t}\"}}}}\n{{\"id\":2,\"method\":\"a\"}}\n").as_bytes());
+        assert_eq!(calls, ["a"]);
+        assert_eq!(r[0], json!({"id": 1, "ok": true, "result": {"authenticated": true}}));
+        assert_eq!(r[1]["id"], 2);
+        assert_eq!(r[1]["ok"], true);
+    }
+
+    #[test]
+    fn tcp_connection_without_token_is_refused() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = channel::<ControlRequest>();
+        let token: Arc<str> = Arc::from(crate::control_auth::generate_token().unwrap().as_str());
+        std::thread::spawn(move || accept_loop_with(listener, tx, egui::Context::default(), Some(token)));
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(b"{\"id\":7,\"method\":\"engine.execute\",\"params\":{\"command\":\"file.new\"}}\n{\"method\":\"y\"}\n").unwrap();
+        let mut text = String::new();
+        c.read_to_string(&mut text).unwrap(); // EOF: the server closed the connection
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("authentication required"), "{text}");
+        assert!(rx.try_recv().is_err(), "nothing may reach the app");
     }
 }

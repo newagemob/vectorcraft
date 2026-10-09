@@ -22,12 +22,21 @@ pub struct Remote {
     addr: String,
     conn: Option<(BufReader<TcpStream>, TcpStream)>,
     next_id: u64,
+    /// Sent as `auth {token}` on every new connection (see `control_client`).
+    token: Option<String>,
 }
 
 impl Remote {
     /// Connect to `addr` (e.g. `127.0.0.1:7979`), failing fast when nothing is listening.
+    /// The token comes from the environment (`crate::control_client::token_from_env`).
     pub fn connect(addr: &str) -> std::io::Result<Self> {
-        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1 };
+        let token = crate::control_client::token_from_env().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        Self::connect_with_token(addr, token)
+    }
+
+    /// Connect to `addr`, authenticating with `token` when the app requires one.
+    pub fn connect_with_token(addr: &str, token: Option<String>) -> std::io::Result<Self> {
+        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1, token };
         r.reconnect()?;
         Ok(r)
     }
@@ -46,7 +55,12 @@ impl Remote {
                     // The app answers within 60 s (its own timeout); leave headroom.
                     s.set_read_timeout(Some(Duration::from_secs(90))).ok();
                     let read = s.try_clone()?;
-                    self.conn = Some((BufReader::new(read), s));
+                    let mut reader = BufReader::new(read);
+                    let mut s = s;
+                    if let Some(token) = &self.token {
+                        authenticate(&mut reader, &mut s, token)?;
+                    }
+                    self.conn = Some((reader, s));
                     return Ok(());
                 }
                 Err(e) => last = e,
@@ -103,5 +117,20 @@ impl Backend for Remote {
 
     fn describe(&self) -> String {
         format!("remote {}", self.addr)
+    }
+}
+
+/// Send `auth {token}` and require `{"ok": true}`.
+fn authenticate(reader: &mut BufReader<TcpStream>, writer: &mut TcpStream, token: &str) -> std::io::Result<()> {
+    writeln!(writer, "{}", json!({"id": 0, "method": "auth", "params": {"token": token}}))?;
+    writer.flush()?;
+    let mut reply = String::new();
+    reader.read_line(&mut reply)?;
+    let v: Value = serde_json::from_str(reply.trim()).unwrap_or(Value::Null);
+    if v.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        let why = v.get("error").and_then(Value::as_str).unwrap_or("no reply");
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("control channel refused the token: {why}")))
     }
 }

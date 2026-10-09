@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+pub mod control_client;
 mod headless;
 pub mod logging;
 mod prompts;

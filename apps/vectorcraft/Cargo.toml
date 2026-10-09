@@ -22,6 +22,8 @@ vectorcraft-ui-egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wayland", "x11"] }
 egui = { workspace = true }
 serde_json = { workspace = true }
+# Per-launch control-channel token (control_auth.rs); already in the lockfile.
+getrandom = "0.3"
 log = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

@@ -611,3 +611,35 @@ drags its points (a press on a point focuses it, and a press on one of the focus
 handle); a Mesh tool click inside a mesh envelope adds a row and a column. While an envelope or its content is
 selected the Control bar shows its controls (Edit Envelope / Edit Contents, warp style, orientation, bend and
 distortions or mesh rows and columns, Reset, Envelope Options); each runs an `object.envelope.*` command.
+
+## Authentication and discovery
+
+The channel needs a per-launch token, with the same handshake as PhotoCraft's control port. The first
+request on every connection must be
+
+```text
+→ {"id": 0, "method": "auth", "params": {"token": "<64 hex characters>"}}
+← {"id": 0, "ok": true, "result": {"authenticated": true}}
+```
+
+Any other first request is answered `{"id": …, "ok": false, "error": "authentication required"}` and the
+connection is closed, so nothing runs on it.
+
+| Flag (environment variable) | Meaning |
+|---|---|
+| `--control <port>` (`VECTORCRAFT_CONTROL_PORT`) | Listen on `127.0.0.1:<port>`; `0` picks a free port |
+| `--control-token <hex>` (`VECTORCRAFT_CONTROL_TOKEN`) | Use this token (64 hex characters) instead of a fresh one |
+| `--control-token-file <path>` (`VECTORCRAFT_CONTROL_TOKEN_FILE`) | Reuse the token in this file, or create it (owner-only) with a fresh one |
+| `--control-port-file <path>` (`VECTORCRAFT_CONTROL_PORT_FILE`) | Once listening, write `{"port": <u16>, "token": "<hex>", "pid": <u32>}` here (owner-only) |
+| `$ORCHA_CONTROL_DIR` | Without `--control-port-file`, the port file is `$ORCHA_CONTROL_DIR/vectorcraft.json` |
+| `--control-no-auth` (`VECTORCRAFT_CONTROL_NO_AUTH=1`) | The old unauthenticated channel (explicit opt-in) |
+
+Without a token flag or a port file, the generated token is printed to standard error
+(`vectorcraft: control token: …`). Clients (`vectorcraft-cli`) take `--control-token`, `--control-token-file` (a
+bare token or a port file) or `--control-port-file` (address and token), or the same environment
+variables, and send `auth` on every new connection:
+
+```sh
+vectorcraft --control 0 --control-port-file /tmp/vectorcraft.json &
+vectorcraft-cli mcp --control-port-file /tmp/vectorcraft.json
+```

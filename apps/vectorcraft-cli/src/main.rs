@@ -56,6 +56,8 @@ USAGE:
   vectorcraft-cli mcp [--connect ADDR | --headless]
       Run the MCP server on stdio. Default: connect to a running app at 127.0.0.1:7979
       (vectorcraft --control 7979), falling back to a headless in-process session.
+      --control-token HEX | --control-token-file PATH: the app's control token (also VECTORCRAFT_CONTROL_TOKEN[_FILE]);
+      --control-port-file PATH: address and token of `vectorcraft --control 0 --control-port-file PATH`.
 
   vectorcraft-cli run [--in FILE] [--cmd ID [--params JSON]]... [--export FILE]... [--scale N]
       Headless batch: open FILE (any readable format) or start a new document, run commands in
@@ -123,14 +125,21 @@ fn main() -> ExitCode {
 fn mcp(args: &[String]) -> Result<(), String> {
     let mut connect: Option<String> = None;
     let mut headless = false;
-    let mut it = args.iter();
+    let mut control = vectorcraft_mcp::control_client::ControlClientArgs::default();
+    let mut it = args.iter().cloned();
     while let Some(a) = it.next() {
+        if control.take(&a, &mut it)? {
+            continue;
+        }
         match a.as_str() {
-            "--connect" => connect = Some(it.next().cloned().ok_or("--connect needs an address")?),
+            "--connect" => connect = Some(it.next().ok_or("--connect needs an address")?),
             "--headless" => headless = true,
             other => return Err(format!("unknown mcp option `{other}`")),
         }
     }
+    // `--control-port-file`: the address (and token) of an app started with `--control 0`.
+    let (file_addr, token) = control.resolve()?;
+    let connect = connect.or(file_addr);
     if headless && connect.is_some() {
         return Err("use either --connect or --headless".into());
     }
@@ -138,9 +147,9 @@ fn mcp(args: &[String]) -> Result<(), String> {
         Box::new(Headless::with_document())
     } else if let Some(addr) = connect {
         // Explicit address: fail loudly if the app isn't there.
-        Box::new(Remote::connect(&addr).map_err(|e| format!("cannot connect to {addr}: {e}"))?)
+        Box::new(Remote::connect_with_token(&addr, token).map_err(|e| format!("cannot connect to {addr}: {e}"))?)
     } else {
-        match Remote::connect(DEFAULT_ADDR) {
+        match Remote::connect_with_token(DEFAULT_ADDR, token) {
             Ok(r) => Box::new(r),
             Err(_) => Box::new(Headless::with_document()),
         }
